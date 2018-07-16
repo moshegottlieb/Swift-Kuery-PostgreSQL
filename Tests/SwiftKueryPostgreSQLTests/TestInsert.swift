@@ -58,12 +58,15 @@ class TestInsert: XCTestCase {
 
         let tableName = tableInsert3
     }
+
     func testInsert() {
         let t = MyTable()
         let t2 = MyTable2()
 
         let pool = CommonUtils.sharedInstance.getConnectionPool()
         performTest(asyncTasks: { expectation in
+
+            let semaphore = DispatchSemaphore(value: 0)
 
             guard let connection = pool.getConnection() else {
                 XCTFail("Failed to get connection")
@@ -153,6 +156,7 @@ class TestInsert: XCTestCase {
                                                         executeQuery(query: dropT, connection: connection) { result, rows in
                                                             XCTAssertEqual(result.success, true, "DROP TABLE failed")
                                                             XCTAssertNil(result.asError, "Error in DELETE: \(result.asError!)")
+                                                            semaphore.signal()
                                                         }
                                                     }
                                                 }
@@ -165,6 +169,7 @@ class TestInsert: XCTestCase {
                     }
                 }
             }
+            semaphore.wait()
             expectation.fulfill()
         })
     }
@@ -174,6 +179,8 @@ class TestInsert: XCTestCase {
 
         let pool = CommonUtils.sharedInstance.getConnectionPool()
         performTest(asyncTasks: { expectation in
+
+            let semaphore = DispatchSemaphore(value: 0)
 
             guard let connection = pool.getConnection() else {
                 XCTFail("Failed to get connection")
@@ -198,10 +205,12 @@ class TestInsert: XCTestCase {
                         executeQuery(query: dropT3, connection: connection) { result, rows in
                             XCTAssertEqual(result.success, true, "DROP TABLE failed")
                             XCTAssertNil(result.asError, "Error in DELETE: \(result.asError!)")
+                            semaphore.signal()
                         }
                     }
                 }
             }
+            semaphore.wait()
             expectation.fulfill()
         })
     }

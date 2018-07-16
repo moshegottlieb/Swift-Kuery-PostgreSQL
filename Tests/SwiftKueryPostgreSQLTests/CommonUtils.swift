@@ -52,58 +52,70 @@ func read(fileName: String) -> String {
 }
 
 func executeQuery(query: Query, connection: Connection, callback: @escaping (QueryResult, [[Any?]]?)->()) {
-    do {
-        try print("=======\(connection.descriptionOf(query: query))=======")
-    }
-    catch {}
-    connection.execute(query: query) { result in
-        let rows = printResultAndGetRowsAsArray(result)
-        callback(result, rows)
+    DispatchQueue.global().async {
+        connection.execute(query: query) { result in
+            do {
+                try print("=======\(connection.descriptionOf(query: query))=======")
+            }
+            catch {}
+            let rows = printResultAndGetRowsAsArray(result)
+            callback(result, rows)
+        }
     }
 }
 
 func executeQueryWithParameters(query: Query, connection: Connection, parameters: Any?..., callback: @escaping (QueryResult, [[Any?]]?)->()) {
-    do {
-        try print("=======\(connection.descriptionOf(query: query))=======")
-    }
-    catch {}
-    connection.execute(query: query, parameters: parameters) { result in
-        let rows = printResultAndGetRowsAsArray(result)
-        callback(result, rows)
+    DispatchQueue.global().async {
+        connection.execute(query: query, parameters: parameters) { result in
+            do {
+                try print("=======\(connection.descriptionOf(query: query))=======")
+            }
+            catch {}
+            let rows = printResultAndGetRowsAsArray(result)
+            callback(result, rows)
+        }
     }
 }
 
 func executeQueryWithNamedParameters(query: Query, connection: Connection, parameters: [String:Any?], callback: @escaping (QueryResult, [[Any?]]?)->()) {
-    do {
-        try print("=======\(connection.descriptionOf(query: query))=======")
-    }
-    catch {}
-    connection.execute(query: query, parameters: parameters) { result in
-        let rows = printResultAndGetRowsAsArray(result)
-        callback(result, rows)
+    DispatchQueue.global().async {
+        connection.execute(query: query, parameters: parameters) { result in
+            do {
+                try print("=======\(connection.descriptionOf(query: query))=======")
+            }
+            catch {}
+            let rows = printResultAndGetRowsAsArray(result)
+            callback(result, rows)
+        }
     }
 }
 
 
 func executeRawQueryWithParameters(_ raw: String, connection: Connection, parameters: Any?..., callback: @escaping (QueryResult, [[Any?]]?)->()) {
-    print("=======\(raw)=======")
-    connection.execute(raw, parameters: parameters) { result in
-        let rows = printResultAndGetRowsAsArray(result)
-        callback(result, rows)
+    DispatchQueue.global().async {
+            connection.execute(raw, parameters: parameters) { result in
+            print("=======\(raw)=======")
+            let rows = printResultAndGetRowsAsArray(result)
+            callback(result, rows)
+        }
     }
 }
 
 func executeRawQuery(_ raw: String, connection: Connection, callback: @escaping (QueryResult, [[Any?]]?)->()) {
-    print("=======\(raw)=======")
-    connection.execute(raw) { result in
-        let rows = printResultAndGetRowsAsArray(result)
-        callback(result, rows)
+    DispatchQueue.global().async {
+        connection.execute(raw) { result in
+            print("=======\(raw)=======")
+            let rows = printResultAndGetRowsAsArray(result)
+            callback(result, rows)
+        }
     }
 }
 
 func cleanUp(table: String, connection: Connection, callback: @escaping (QueryResult)->()) {
-    connection.execute("DROP TABLE \"" + table + "\"") { result in
-        callback(result)
+    DispatchQueue.global().async {
+        connection.execute("DROP TABLE \"" + table + "\"") { result in
+            callback(result)
+        }
     }
 }
 
@@ -198,7 +210,7 @@ class CommonUtils {
         let username = read(fileName: "username.txt")
         let password = read(fileName: "password.txt")
         
-        pool = PostgreSQLConnection.createPool(host: host, port: port, options: [.userName(username), .password(password)], poolOptions: ConnectionPoolOptions(initialCapacity: 0, maxCapacity: 1, timeout: 10000))
+        pool = PostgreSQLConnection.createPool(host: host, port: port, options: [.userName(username), .password(password)], poolOptions: ConnectionPoolOptions(initialCapacity: 0, maxCapacity: 1, timeout: 100000))
         return pool!
     }
     
@@ -208,7 +220,7 @@ class CommonUtils {
         let username = read(fileName: "username.txt")
         let password = read(fileName: "password.txt")
         
-        pool = PostgreSQLConnection.createPool(host: host, port: port, options: [.userName(username), .password(password)], poolOptions: ConnectionPoolOptions(initialCapacity: 0, maxCapacity: 1, timeout: 10000))
+        pool = PostgreSQLConnection.createPool(host: host, port: port, options: [.userName(username), .password(password)], poolOptions: ConnectionPoolOptions(initialCapacity: 0, maxCapacity: 1, timeout: 100000))
         return pool!
     }
 

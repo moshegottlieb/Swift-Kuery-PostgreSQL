@@ -39,7 +39,9 @@ public class PostgreSQLConnection: Connection {
     private weak var currentResultFetcher: PostgreSQLResultFetcher?
     
     private var preparedStatements = Set<String>()
-    
+
+    private var poolWrapper: ConnectionPoolConnection? = nil
+
     /// An indication whether there is a connection to the database.
     public var isConnected: Bool {
         return connection != nil && PQstatus(connection) == CONNECTION_OK
@@ -175,7 +177,11 @@ public class PostgreSQLConnection: Connection {
         let connectionParameters = extractConnectionParameters(host: host, port: port, options: options)
         return createPool(connectionParameters, options: poolOptions)
     }
-    
+
+    public func setConnectionPoolWrapper(to wrapper: ConnectionPoolConnection?) {
+        poolWrapper = wrapper
+    }
+
     /// Return a String representation of the query.
     ///
     /// - Parameter query: The query.
@@ -188,21 +194,41 @@ public class PostgreSQLConnection: Connection {
     /// Establish a connection with the database.
     ///
     /// - Parameter onCompletion: The function to be called when the connection is established.
-    public func connect(onCompletion: (QueryError?) -> ()) {
-        if connectionParameters == "" {
-            onCompletion(QueryError.connection("No connection parameters."))
+    public func connect(onCompletion: @escaping (QueryError?) -> ()) {
+        DispatchQueue.global().async {
+            if self.connectionParameters == "" {
+                onCompletion(QueryError.connection("No connection parameters."))
+            }
+            self.connection = PQconnectdb(self.connectionParameters)
+
+            let queryError: QueryError?
+            if let error = String(validatingUTF8: PQerrorMessage(self.connection)), !error.isEmpty {
+                queryError = QueryError.connection(error)
+                self.connection = nil
+            }
+            else {
+                queryError = nil
+            }
+            onCompletion(queryError)
         }
-        connection = PQconnectdb(connectionParameters)
-        
-        let queryError: QueryError?
-        if let error = String(validatingUTF8: PQerrorMessage(connection)), !error.isEmpty {
-            queryError = QueryError.connection(error)
-            connection = nil
+    }
+
+    /// Establish a connection with the database.
+    ///
+    /// - Parameter onCompletion: The function to be called when the connection is established.
+    public func connectSync() -> QueryError? {
+        var error: QueryError?
+        let semaphore = DispatchSemaphore(value: 0)
+        connect { err in
+            error = err
+            semaphore.signal()
         }
-        else {
-            queryError = nil
+        semaphore.wait()
+        guard let errorUnwrapped = error else {
+            // Everything worked
+            return nil
         }
-        onCompletion(queryError)
+        return errorUnwrapped
     }
     
     /// Close the connection to the database.
@@ -217,16 +243,36 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter parameters: An array of the parameters.
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(query: Query, parameters: [Any?], onCompletion: @escaping ((QueryResult) -> ())) {
-        do {
-            let postgresQuery = try buildQuery(query)
-            execute(query: postgresQuery, preparedStatement: nil, with: parameters, onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            do {
+                let postgresQuery = try self.buildQuery(query)
+                self.execute(query: postgresQuery, preparedStatement: nil, with: parameters, onCompletion: onCompletion)
+            }
+            catch QueryError.syntaxError(let error) {
+                onCompletion(.error(QueryError.syntaxError(error)))
+            }
+            catch {
+                onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+            }
         }
-        catch QueryError.syntaxError(let error) {
-            onCompletion(.error(QueryError.syntaxError(error)))
+    }
+
+    /// Execute a query with parameters.
+    ///
+    /// - Parameter query: The query to execute.
+    /// - Parameter parameters: An array of the parameters.
+    public func executeSync(query: Query, parameters: [Any?]) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(query: query, parameters: parameters) { res in
+            result = res
+            semaphore.signal()
         }
-        catch {
-            onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
         }
+        return resultUnwrapped
     }
 
     /// Execute a query.
@@ -234,44 +280,112 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter query: The query to execute.
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(query: Query, onCompletion: @escaping ((QueryResult) -> ())) {
-        do {
-            let postgresQuery = try buildQuery(query)
-            execute(query: postgresQuery, preparedStatement: nil, with: [Any?](), onCompletion: onCompletion)
-        }
-        catch QueryError.syntaxError(let error) {
-            onCompletion(.error(QueryError.syntaxError(error)))
-        }
-        catch {
-            onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+        DispatchQueue.global().async {
+            do {
+                let postgresQuery = try self.buildQuery(query)
+                self.execute(query: postgresQuery, preparedStatement: nil, with: [Any?](), onCompletion: onCompletion)
+            }
+            catch QueryError.syntaxError(let error) {
+                onCompletion(.error(QueryError.syntaxError(error)))
+            }
+            catch {
+                onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+            }
         }
     }
-    
+
+    /// Execute a query.
+    ///
+    /// - Parameter query: The query to execute.
+    public func executeSync(query: Query) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(query: query) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
+    }
+
     /// Execute a raw query.
     ///
-    /// - Parameter query: A String with the query to execute.
+    /// - Parameter raw: A String with the raw query to execute.
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(_ raw: String, onCompletion: @escaping ((QueryResult) -> ())) {
-        execute(query: raw, preparedStatement: nil, with: [Any?](), onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.execute(query: raw, preparedStatement: nil, with: [Any?](), onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Execute a raw query.
+    ///
+    /// - Parameter raw: A String with the raw query to execute.
+    public func executeSync(_ raw: String) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(raw) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
+    }
+
     /// Execute a raw query with parameters.
     ///
-    /// - Parameter query: A String with the query to execute.
+    /// - Parameter raw: A String with the raw query to execute.
     /// - Parameter parameters: An array of the parameters.
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(_ raw: String, parameters: [Any?], onCompletion: @escaping ((QueryResult) -> ())) {
-        execute(query: raw, preparedStatement: nil, with: parameters, onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.execute(query: raw, preparedStatement: nil, with: parameters, onCompletion: onCompletion)
+        }
     }
-    
+
     /// Execute a raw query with parameters.
     ///
-    /// - Parameter query: A String with the query to execute.
+    /// - Parameter raw: A String with the raw query to execute.
+    /// - Parameter parameters: An array of the parameters.
+    public func executeSync(_ raw: String, parameters: [Any?]) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(raw, parameters: parameters) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
+    }
+
+    /// Execute a raw query with parameters.
+    ///
+    /// - Parameter raw: A String with the raw query to execute.
     /// - Parameter parameters: A dictionary of the parameters with parameter names as the keys.
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(_ raw: String, parameters: [String:Any?], onCompletion: @escaping ((QueryResult) -> ())) {
-        onCompletion(.error(QueryError.unsupported("Named parameters in raw queries are not supported in PostgreSQL")))
+        DispatchQueue.global().async {
+            onCompletion(.error(QueryError.unsupported("Named parameters in raw queries are not supported in PostgreSQL")))
+        }
     }
-    
+
+    /// Execute a raw query with parameters.
+    ///
+    /// - Parameter raw: A String with the raw query to execute.
+    /// - Parameter parameters: A dictionary of the parameters with parameter names as the keys.
+    public func executeSync(_ raw: String, parameters: [String:Any?]) -> QueryResult {
+        return .error(QueryError.unsupported("Named parameters in raw queries are not supported in PostgreSQL"))
+    }
+
     /// Prepare statement.
     ///
     /// - Parameter query: The query to prepare statement for.
@@ -294,7 +408,7 @@ public class PostgreSQLConnection: Connection {
         }
         return PostgreSQLPreparedStatement(name: statementName, query: raw)
     }
-    
+
     private func prepareStatement(name: String, for query: String) -> String? {
         if let error = setUpForRunningQuery() {
             return error
@@ -321,25 +435,84 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter preparedStatement: The prepared statement to execute.
     /// - Parameter onCompletion: The function to be called when the execution has completed.
     public func execute(preparedStatement: PreparedStatement, onCompletion: @escaping ((QueryResult) -> ()))  {
-        execute(query: nil, preparedStatement: preparedStatement, with: [Any?](), onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.execute(query: nil, preparedStatement: preparedStatement, with: [Any?](), onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Execute a prepared statement.
+    ///
+    /// - Parameter preparedStatement: The prepared statement to execute.
+    public func executeSync(preparedStatement: PreparedStatement) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(preparedStatement: preparedStatement) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
+    }
+
     /// Execute a prepared statement with parameters.
     ///
     /// - Parameter preparedStatement: The prepared statement to execute.
     /// - Parameter parameters: An array of the parameters.
     /// - Parameter onCompletion: The function to be called when the execution has completed.
     public func execute(preparedStatement: PreparedStatement, parameters: [Any?], onCompletion: @escaping ((QueryResult) -> ())) {
-        execute(query: nil, preparedStatement: preparedStatement, with: parameters, onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.execute(query: nil, preparedStatement: preparedStatement, with: parameters, onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Execute a prepared statement with parameters.
+    ///
+    /// - Parameter preparedStatement: The prepared statement to execute.
+    /// - Parameter parameters: An array of the parameters.
+    public func executeSync(preparedStatement: PreparedStatement, parameters: [Any?]) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(preparedStatement: preparedStatement, parameters: parameters) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
+    }
+
     /// Execute a prepared statement with parameters.
     ///
     /// - Parameter preparedStatement: The prepared statement to execute.
     /// - Parameter parameters: A dictionary of the parameters with parameter names as the keys.
     /// - Parameter onCompletion: The function to be called when the execution has completed.
     public func execute(preparedStatement: PreparedStatement, parameters: [String:Any?], onCompletion: @escaping ((QueryResult) -> ())) {
-        onCompletion(.error(QueryError.unsupported("Named parameters in prepared statemennts are not supported in PostgreSQL")))
+        DispatchQueue.global().async {
+            onCompletion(.error(QueryError.unsupported("Named parameters in prepared statemennts are not supported in PostgreSQL")))
+        }
+    }
+
+    /// Execute a prepared statement with parameters.
+    ///
+    /// - Parameter preparedStatement: The prepared statement to execute.
+    /// - Parameter parameters: A dictionary of the parameters with parameter names as the keys.
+    public func executeSync(preparedStatement: PreparedStatement, parameters: [String:Any?]) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        execute(preparedStatement: preparedStatement, parameters: parameters) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from execute")))
+        }
+        return resultUnwrapped
     }
 
     /// Release a prepared statement.
@@ -347,8 +520,27 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter preparedStatement: The prepared statement to release.
     /// - Parameter onCompletion: The function to be called when the execution has completed.
     public func release(preparedStatement: PreparedStatement, onCompletion: @escaping ((QueryResult) -> ())) {
-        // No need to deallocate prepared statements in PostgreSQL.
-        onCompletion(.successNoData)
+        DispatchQueue.global().async {
+            // No need to deallocate prepared statements in PostgreSQL.
+            onCompletion(.successNoData)
+        }
+    }
+
+    /// Release a prepared statement.
+    ///
+    /// - Parameter preparedStatement: The prepared statement to release.
+    public func releaseSync(preparedStatement: PreparedStatement) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        release(preparedStatement: preparedStatement) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from release")))
+        }
+        return resultUnwrapped
     }
 
     private func execute(query: String?, preparedStatement: PreparedStatement?, with parameters: [Any?], onCompletion: @escaping ((QueryResult) -> ())) {
@@ -361,7 +553,7 @@ public class PostgreSQLConnection: Connection {
             onCompletion(.error(QueryError.connection(error)))
             return
         }
-        
+
         var parameterPointers = [UnsafeMutablePointer<Int8>?]()
         var parameterData = [UnsafePointer<Int8>?]()
         // At the moment we only create string parameters. Binary parameters should be added.
@@ -388,7 +580,7 @@ public class PostgreSQLConnection: Connection {
                 onCompletion(.error(QueryError.unsupported("Failed to execute unsupported prepared statement")))
                 return
             }
-            
+
             if !preparedStatements.contains(statement.name) {
                 if let error = prepareStatement(name: statement.name, for: statement.query) {
                     onCompletion(.error(QueryError.databaseError(error)))
@@ -404,11 +596,11 @@ public class PostgreSQLConnection: Connection {
         for pointer in parameterPointers {
             free(pointer)
         }
-        
+
         PQsetSingleRowMode(connection)
         processQueryResult(query: query ?? "Execution of prepared statement \(preparedStatement!)", onCompletion: onCompletion)
     }
-    
+
     private func processQueryResult(query: String, onCompletion: @escaping ((QueryResult) -> ())) {
         guard let result = PQgetResult(connection) else {
             setState(.idle)
@@ -416,93 +608,210 @@ public class PostgreSQLConnection: Connection {
             if let error = String(validatingUTF8: PQerrorMessage(connection)) {
                 errorMessage += " Error: \(error)."
             }
-            onCompletion(.error(QueryError.noResult(errorMessage)))
+            runCompletionHandler(.error(QueryError.noResult(errorMessage)), onCompletion: onCompletion)
             return
         }
-        
+
         let status = PQresultStatus(result)
         if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
             // Since we set the single row mode, PGRES_TUPLES_OK means the result is empty, i.e. there are
             // no rows to return.
             clearResult(result, connection: self)
-            onCompletion(.successNoData)
+            runCompletionHandler(.successNoData, onCompletion: onCompletion)
         }
         else if status == PGRES_SINGLE_TUPLE {
             let resultFetcher = PostgreSQLResultFetcher(queryResult: result, connection: self)
             setState(.fetchingResultSet)
             currentResultFetcher = resultFetcher
-            onCompletion(.resultSet(ResultSet(resultFetcher)))
+            runCompletionHandler(.resultSet(ResultSet(resultFetcher, connection: self, connectionWrapper: self.poolWrapper)), onCompletion: onCompletion)
         }
         else {
             let errorMessage = String(validatingUTF8: PQresultErrorMessage(result)) ?? "Unknown"
             clearResult(result, connection: self)
-            onCompletion(.error(QueryError.databaseError("Query execution error:\n" + errorMessage + " For query: " + query)))
+            runCompletionHandler(.error(QueryError.databaseError("Query execution error:\n" + errorMessage + " For query: " + query)), onCompletion: onCompletion)
         }
     }
-    
-    
+
+    private func runCompletionHandler(_ queryResult: QueryResult, onCompletion: @escaping ((QueryResult) -> ())) {
+        DispatchQueue.global().async {
+            onCompletion(queryResult)
+        }
+        setConnectionPoolWrapper(to: nil)
+    }
+
     /// Start a transaction.
     ///
     /// - Parameter onCompletion: The function to be called when the execution of start transaction command has completed.
     public func startTransaction(onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "BEGIN", inTransaction: false, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "BEGIN", inTransaction: false, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Start a transaction.
+    ///
+    public func startTransactionSync() -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        startTransaction() { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from startTransaction")))
+        }
+        return resultUnwrapped
+    }
+
     /// Commit the current transaction.
     ///
     /// - Parameter onCompletion: The function to be called when the execution of commit transaction command has completed.
     public func commit(onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "COMMIT", inTransaction: true, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "COMMIT", inTransaction: true, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Commit the current transaction.
+    ///
+    public func commitSync() -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        commit() { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from commit")))
+        }
+        return resultUnwrapped
+    }
+
     /// Rollback the current transaction.
     ///
     /// - Parameter onCompletion: The function to be called when the execution of rolback transaction command has completed.
     public func rollback(onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "ROLLBACK", inTransaction: true, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "ROLLBACK", inTransaction: true, changeTransactionState: true, errorMessage: "Failed to rollback the transaction", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Rollback the current transaction.
+    ///
+    public func rollbackSync() -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        rollback() { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from rollback")))
+        }
+        return resultUnwrapped
+    }
+
     /// Create a savepoint.
     ///
     /// - Parameter savepoint: The name to  be given to the created savepoint.
     /// - Parameter onCompletion: The function to be called when the execution of create savepoint command has completed.
     public func create(savepoint: String, onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "SAVEPOINT \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to create the savepoint \(savepoint)", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "SAVEPOINT \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to create the savepoint \(savepoint)", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Create a savepoint.
+    ///
+    /// - Parameter savepoint: The name to  be given to the created savepoint.
+    public func createSync(savepoint: String) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        create(savepoint: savepoint) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from create")))
+        }
+        return resultUnwrapped
+    }
+
     /// Rollback the current transaction to the specified savepoint.
     ///
     /// - Parameter to savepoint: The name of the savepoint to rollback to.
     /// - Parameter onCompletion: The function to be called when the execution of rolback transaction command has completed.
     public func rollback(to savepoint: String, onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "ROLLBACK TO \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to rollback to the savepoint \(savepoint)", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "ROLLBACK TO \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to rollback to the savepoint \(savepoint)", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Rollback the current transaction to the specified savepoint.
+    ///
+    /// - Parameter to savepoint: The name of the savepoint to rollback to.
+    public func rollbackSync(to savepoint: String) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        rollback(to: savepoint) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from rollback")))
+        }
+        return resultUnwrapped
+    }
+
     /// Release a savepoint.
     ///
     /// - Parameter savepoint: The name of the savepoint to release.
     /// - Parameter onCompletion: The function to be called when the execution of release savepoint command has completed.
     public func release(savepoint: String, onCompletion: @escaping ((QueryResult) -> ())) {
-        executeTransaction(command: "RELEASE SAVEPOINT \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to release the savepoint \(savepoint)", onCompletion: onCompletion)
+        DispatchQueue.global().async {
+            self.executeTransaction(command: "RELEASE SAVEPOINT \(savepoint)", inTransaction: true, changeTransactionState: false, errorMessage: "Failed to release the savepoint \(savepoint)", onCompletion: onCompletion)
+        }
     }
-    
+
+    /// Release a savepoint.
+    ///
+    /// - Parameter savepoint: The name of the savepoint to release.
+    public func releaseSync(savepoint: String) -> QueryResult {
+        var result: QueryResult?
+        let semaphore = DispatchSemaphore(value: 0)
+        release(savepoint: savepoint) { res in
+            result = res
+            semaphore.signal()
+        }
+        semaphore.wait()
+        guard let resultUnwrapped = result else {
+            return (.error(QueryError.noResult("No ResultSet from rollback")))
+        }
+        return resultUnwrapped
+    }
+
     private func executeTransaction(command: String, inTransaction: Bool, changeTransactionState: Bool, errorMessage: String, onCompletion: @escaping ((QueryResult) -> ())) {
         guard let connection = connection else {
             onCompletion(.error(QueryError.connection("Connection is disconnected")))
             return
         }
-        
+
         guard self.inTransaction == inTransaction else {
             let error = self.inTransaction ? "Transaction already exists" : "No transaction exists"
             onCompletion(.error(QueryError.transactionError(error)))
             return
         }
-        
+
         if let error = setUpForRunningQuery() {
             onCompletion(.error(QueryError.connection(error)))
             return
         }
-        
+
         let result = PQexec(connection, command)
         let status = PQresultStatus(result)
         if status != PGRES_COMMAND_OK {
@@ -516,11 +825,11 @@ public class PostgreSQLConnection: Connection {
             onCompletion(.error(QueryError.databaseError(message)))
             return
         }
-        
+
         if changeTransactionState {
             self.inTransaction = !self.inTransaction
         }
-        
+
         PQclear(result)
         setState(.idle)
         onCompletion(.successNoData)
@@ -543,15 +852,15 @@ public class PostgreSQLConnection: Connection {
       }
       return postgresQuery
     }
-    
+
     private func lockStateLock() {
         _ = stateLock.wait(timeout: DispatchTime.distantFuture)
     }
-    
+
     private func unlockStateLock() {
         stateLock.signal()
     }
-    
+
     func setState(_ newState: ConnectionState) {
         lockStateLock()
         if state == .fetchingResultSet {
@@ -560,7 +869,7 @@ public class PostgreSQLConnection: Connection {
         state = newState
         unlockStateLock()
     }
-    
+
     func setUpForRunningQuery() -> String? {
         lockStateLock()
 
@@ -568,19 +877,19 @@ public class PostgreSQLConnection: Connection {
         case .runningQuery:
             unlockStateLock()
             return "The connection is in the middle of running a query"
-            
+
         case .fetchingResultSet:
             currentResultFetcher?.hasMoreRows = false
             unlockStateLock()
             clearResult(nil, connection: self)
             lockStateLock()
-            
+
         case .idle:
             break
         }
-        
+
         state = .runningQuery
-        
+
         unlockStateLock()
 
         return nil
