@@ -197,7 +197,7 @@ public class PostgreSQLConnection: Connection {
     public func connect(onCompletion: @escaping (QueryError?) -> ()) {
         DispatchQueue.global().async {
             if self.connectionParameters == "" {
-                onCompletion(QueryError.connection("No connection parameters."))
+                self.runCompletionHandler(QueryError.connection("No connection parameters."), onCompletion: onCompletion)
             }
             self.connection = PQconnectdb(self.connectionParameters)
 
@@ -209,7 +209,7 @@ public class PostgreSQLConnection: Connection {
             else {
                 queryError = nil
             }
-            onCompletion(queryError)
+            self.runCompletionHandler(queryError, onCompletion: onCompletion)
         }
     }
 
@@ -249,10 +249,10 @@ public class PostgreSQLConnection: Connection {
                 self.execute(query: postgresQuery, preparedStatement: nil, with: parameters, onCompletion: onCompletion)
             }
             catch QueryError.syntaxError(let error) {
-                onCompletion(.error(QueryError.syntaxError(error)))
+                self.runCompletionHandler(.error(QueryError.syntaxError(error)), onCompletion: onCompletion)
             }
             catch {
-                onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+                self.runCompletionHandler(.error(QueryError.syntaxError("Failed to build the query")), onCompletion: onCompletion)
             }
         }
     }
@@ -286,10 +286,10 @@ public class PostgreSQLConnection: Connection {
                 self.execute(query: postgresQuery, preparedStatement: nil, with: [Any?](), onCompletion: onCompletion)
             }
             catch QueryError.syntaxError(let error) {
-                onCompletion(.error(QueryError.syntaxError(error)))
+                self.runCompletionHandler(.error(QueryError.syntaxError(error)), onCompletion: onCompletion)
             }
             catch {
-                onCompletion(.error(QueryError.syntaxError("Failed to build the query")))
+                self.runCompletionHandler(.error(QueryError.syntaxError("Failed to build the query")), onCompletion: onCompletion)
             }
         }
     }
@@ -374,7 +374,7 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter onCompletion: The function to be called when the execution of the query has completed.
     public func execute(_ raw: String, parameters: [String:Any?], onCompletion: @escaping ((QueryResult) -> ())) {
         DispatchQueue.global().async {
-            onCompletion(.error(QueryError.unsupported("Named parameters in raw queries are not supported in PostgreSQL")))
+            self.runCompletionHandler(.error(QueryError.unsupported("Named parameters in raw queries are not supported in PostgreSQL")), onCompletion: onCompletion)
         }
     }
 
@@ -493,7 +493,7 @@ public class PostgreSQLConnection: Connection {
     /// - Parameter onCompletion: The function to be called when the execution has completed.
     public func execute(preparedStatement: PreparedStatement, parameters: [String:Any?], onCompletion: @escaping ((QueryResult) -> ())) {
         DispatchQueue.global().async {
-            onCompletion(.error(QueryError.unsupported("Named parameters in prepared statemennts are not supported in PostgreSQL")))
+            self.runCompletionHandler(.error(QueryError.unsupported("Named parameters in prepared statemennts are not supported in PostgreSQL")), onCompletion: onCompletion)
         }
     }
 
@@ -522,7 +522,7 @@ public class PostgreSQLConnection: Connection {
     public func release(preparedStatement: PreparedStatement, onCompletion: @escaping ((QueryResult) -> ())) {
         DispatchQueue.global().async {
             // No need to deallocate prepared statements in PostgreSQL.
-            onCompletion(.successNoData)
+            self.runCompletionHandler(.successNoData, onCompletion: onCompletion)
         }
     }
 
@@ -545,12 +545,12 @@ public class PostgreSQLConnection: Connection {
 
     private func execute(query: String?, preparedStatement: PreparedStatement?, with parameters: [Any?], onCompletion: @escaping ((QueryResult) -> ())) {
         guard let connection = connection else {
-            onCompletion(.error(QueryError.connection("Connection is disconnected")))
+            self.runCompletionHandler(.error(QueryError.connection("Connection is disconnected")), onCompletion: onCompletion)
             return
         }
         
         if let error = setUpForRunningQuery() {
-            onCompletion(.error(QueryError.connection(error)))
+            self.runCompletionHandler(.error(QueryError.connection(error)), onCompletion: onCompletion)
             return
         }
 
@@ -577,13 +577,13 @@ public class PostgreSQLConnection: Connection {
         }
         else if let preparedStatement = preparedStatement {
             guard let statement = preparedStatement as? PostgreSQLPreparedStatement else {
-                onCompletion(.error(QueryError.unsupported("Failed to execute unsupported prepared statement")))
+                self.runCompletionHandler(.error(QueryError.unsupported("Failed to execute unsupported prepared statement")), onCompletion: onCompletion)
                 return
             }
 
             if !preparedStatements.contains(statement.name) {
                 if let error = prepareStatement(name: statement.name, for: statement.query) {
-                    onCompletion(.error(QueryError.databaseError(error)))
+                    self.runCompletionHandler(.error(QueryError.databaseError(error)), onCompletion: onCompletion)
                     return
 
                 }
@@ -635,6 +635,17 @@ public class PostgreSQLConnection: Connection {
     private func runCompletionHandler(_ queryResult: QueryResult, onCompletion: @escaping ((QueryResult) -> ())) {
         DispatchQueue.global().async {
             onCompletion(queryResult)
+        }
+        setConnectionPoolWrapper(to: nil)
+    }
+    
+    private func runCompletionHandler(_ queryError: QueryError?, onCompletion: @escaping ((QueryError?) -> ())) {
+        DispatchQueue.global().async {
+            guard queryError != nil else {
+                onCompletion(nil)
+                return
+            }
+            onCompletion(queryError)
         }
         setConnectionPoolWrapper(to: nil)
     }
@@ -797,18 +808,18 @@ public class PostgreSQLConnection: Connection {
 
     private func executeTransaction(command: String, inTransaction: Bool, changeTransactionState: Bool, errorMessage: String, onCompletion: @escaping ((QueryResult) -> ())) {
         guard let connection = connection else {
-            onCompletion(.error(QueryError.connection("Connection is disconnected")))
+            self.runCompletionHandler(.error(QueryError.connection("Connection is disconnected")), onCompletion: onCompletion)
             return
         }
 
         guard self.inTransaction == inTransaction else {
             let error = self.inTransaction ? "Transaction already exists" : "No transaction exists"
-            onCompletion(.error(QueryError.transactionError(error)))
+            self.runCompletionHandler(.error(QueryError.transactionError(error)), onCompletion: onCompletion)
             return
         }
 
         if let error = setUpForRunningQuery() {
-            onCompletion(.error(QueryError.connection(error)))
+            self.runCompletionHandler(.error(QueryError.connection(error)), onCompletion: onCompletion)
             return
         }
 
@@ -822,7 +833,7 @@ public class PostgreSQLConnection: Connection {
 
             PQclear(result)
             setState(.idle)
-            onCompletion(.error(QueryError.databaseError(message)))
+            self.runCompletionHandler(.error(QueryError.databaseError(message)), onCompletion: onCompletion)
             return
         }
 
@@ -832,7 +843,7 @@ public class PostgreSQLConnection: Connection {
 
         PQclear(result)
         setState(.idle)
-        onCompletion(.successNoData)
+        self.runCompletionHandler(.successNoData, onCompletion: onCompletion)
     }
 
     private func buildQuery(_ query: Query) throws  -> String {
